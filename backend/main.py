@@ -166,49 +166,10 @@ class Agent:
         self.position = np.array(field.snap_to_walkable(self.position[0], self.position[1]), dtype=np.float32)
 
 
-class FhuTracker:
-
-    def __init__(self):
-        self.estimate: Optional[np.ndarray] = None
-
-    def update(
-        self,
-        weighted_positions: List[Tuple[np.ndarray, float]],
-        fallback_positions: Optional[List[np.ndarray]] = None,
-    ) -> Dict[str, float]:
-        if weighted_positions:
-            weights = np.array([w for _, w in weighted_positions], dtype=np.float32)
-            points = np.stack([pos for pos, _ in weighted_positions])
-            weight_sum = float(weights.sum())
-            if abs(weight_sum) < 1e-3:
-                centroid = np.mean(points, axis=0)
-            else:
-                centroid = np.sum(points * weights[:, None], axis=0) / weight_sum
-            confidence = float(np.clip(abs(weight_sum) / (len(weights) + 1), 0.3, 0.98))
-        elif fallback_positions:
-            centroid = np.mean(fallback_positions, axis=0)
-            confidence = 0.35
-        elif self.estimate is not None:
-            centroid = self.estimate
-            confidence = 0.3
-        else:
-            centroid = np.zeros(2, dtype=np.float32)
-            confidence = 0.2
-
-        self.estimate = centroid
-
-        return {
-            "x": float(self.estimate[0]),
-            "y": float(self.estimate[1]),
-            "confidence": confidence,
-        }
-
-
 class Crowd:
     def __init__(self, field: CollisionField):
         self.field = field
         self.people: List[Agent] = []
-        self.tracker = FhuTracker()
         self.lock = asyncio.Lock()
         self.update_task: Optional[asyncio.Task] = None
         self.max_unshrink_interval = 300.0
@@ -315,16 +276,7 @@ class Crowd:
                 self._maybe_random_shrink(current_time)
                 self._maybe_spawn_small_agents(current_time)
 
-                weighted_targets = []
-                for person in self.people:
-                    recency = max(0.0, current_time - person.last_unshrinked_at)
-                    weight = self._weight_profile(recency, person.is_large)
-                    weighted_targets.append((person.position.copy(), weight))
-
-                tracker_payload = self.tracker.update(
-                    weighted_targets,
-                    fallback_positions=[p.position for p in self.people],
-                )
+                tracker_payload = self._compute_fhu_estimate()
                 large_count = sum(1 for p in self.people if p.is_large)
                 small_count = len(self.people) - large_count
                 self._last_state = {
@@ -397,21 +349,30 @@ class Crowd:
     async def reset(self) -> None:
         async with self.lock:
             self._spawn_agents()
-            self.tracker.estimate = None
             self._sigma_memory.clear()
 
-    def _weight_profile(self, recency: float, is_large: bool) -> float:
-        if is_large:
-            anchor_pull = 0.78 * math.exp(-recency / 18.0)
-            slow_tail = 0.22 * math.exp(-recency / 140.0)
-            gain = (anchor_pull + slow_tail) ** 1.08
-            proximity_bonus = 0.35 + 0.65 * math.exp(-recency / 45.0)
-            return max(0.35, gain * proximity_bonus)
-        drift_relief = math.exp(-recency / 22.0)
-        soft_floor = 1.0 / (1.0 + math.exp(-(recency - 30.0) / 6.0))
-        damp = 0.18 + 0.12 * math.exp(-recency / 180.0)
-        suppression = (0.6 * drift_relief + 0.4 * (1.0 - soft_floor)) * damp
-        return -min(0.18, suppression)
+    def _compute_fhu_estimate(self) -> Dict[str, float]:
+        large_agents = [agent for agent in self.people if agent.is_large]
+        if large_agents:
+            positions = np.stack([agent.position for agent in large_agents])
+            centroid = positions.mean(axis=0)
+            confidence = len(large_agents) / max(1, len(self.people))
+            return {
+                "x": float(centroid[0]),
+                "y": float(centroid[1]),
+                "confidence": float(confidence),
+            }
+
+        if not self.people:
+            return {"x": 0.0, "y": 0.0, "confidence": 0.0}
+
+        fallback_positions = np.stack([agent.position for agent in self.people])
+        centroid = fallback_positions.mean(axis=0)
+        return {
+            "x": float(centroid[0]),
+            "y": float(centroid[1]),
+            "confidence": 0.1,
+        }
 
     def _apply_sigma_wave(self, person: Agent) -> None:
         previous = self._sigma_memory.get(person.agent_id)
