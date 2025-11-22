@@ -5,7 +5,7 @@ import math
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -28,7 +28,6 @@ MAP_PATH = ROOT_DIR / "map.png"
 
 class CollisionField:
 
-    TARGET_HEX = "bfb387"
     TARGET_BGR = np.array([0x87, 0xB3, 0xBF], dtype=np.uint8)
     COLOR_TOLERANCE = 24.0
     DEFAULT_SPAWN_MARGIN = 30
@@ -183,6 +182,7 @@ class Crowd:
         self.next_agent_id = 0
         self._sigma_memory: Dict[int, np.ndarray] = {}
         self._smoothing_alpha = 0.22
+        self._cohesion_sigma = 60.0
         self._last_state: Dict[str, object] = {
             "timestamp": time.time(),
             "people": [],
@@ -355,8 +355,14 @@ class Crowd:
         large_agents = [agent for agent in self.people if agent.is_large]
         if large_agents:
             positions = np.stack([agent.position for agent in large_agents])
-            centroid = positions.mean(axis=0)
-            confidence = len(large_agents) / max(1, len(self.people))
+            weights = self._gaussian_cohesion_weights(positions)
+            if np.count_nonzero(weights) == 0:
+                centroid = positions.mean(axis=0)
+            else:
+                centroid = np.average(positions, axis=0, weights=weights)
+            density = float(np.clip(weights.mean() / max(weights.max(), 1e-3), 0.05, 1.0))
+            size_factor = len(large_agents) / max(1, len(self.people))
+            confidence = float(np.clip(density * size_factor, 0.05, 0.99))
             return {
                 "x": float(centroid[0]),
                 "y": float(centroid[1]),
@@ -383,6 +389,17 @@ class Crowd:
         person.position = smoothed
         self._sigma_memory[person.agent_id] = smoothed.copy()
 
+    def _gaussian_cohesion_weights(self, positions: np.ndarray) -> np.ndarray:
+        if len(positions) <= 1:
+            return np.ones(len(positions), dtype=np.float32)
+
+        diffs = positions[:, None, :] - positions[None, :, :]
+        dist_sq = np.sum(diffs ** 2, axis=2)
+        sigma_sq = max(1.0, self._cohesion_sigma ** 2)
+        kernel = np.exp(-dist_sq / (2.0 * sigma_sq))
+        weights = kernel.sum(axis=1)
+        return weights.astype(np.float32)
+
 
 collision_field = CollisionField(MAP_PATH)
 simulation = Crowd(collision_field)
@@ -396,9 +413,6 @@ async def startup_event() -> None:
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     await simulation.stop()
-
-
-audio_connections: Set[WebSocket] = set()
 
 
 async def _map_state_stream(websocket: WebSocket) -> None:
@@ -432,7 +446,6 @@ def modify_audio_frequency(audio_data: np.ndarray, frequency_modifier: float, sa
 @app.websocket("/ws/audio")
 async def audio_websocket(websocket: WebSocket):
     await websocket.accept()
-    audio_connections.add(websocket)
 
     try:
         while True:
@@ -472,7 +485,7 @@ async def audio_websocket(websocket: WebSocket):
                     print(f"Error in real-time audio processing: {exc}")
 
     except WebSocketDisconnect:
-        audio_connections.remove(websocket)
+        pass
 
 
 @app.websocket("/ws/map")
